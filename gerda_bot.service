@@ -1,0 +1,13 @@
+[Unit]
+Description=Gerda Chat Bot
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/gerda
+ExecStart=/usr/bin/python3 /root/gerda/bot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

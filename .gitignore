@@ -1,0 +1,4 @@
+.env
+gerda.db
+__pycache__/
+*.pyc
