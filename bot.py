@@ -31,7 +31,6 @@ LINK_PATTERN = re.compile(
     re.IGNORECASE
 )
 
-# Реакции на мат — весёлые
 BAD_WORD_REACTIONS = [
     "Ах ты школотрончик! Маме расскажу 😤",
     "Рот помой с мылом! 🧼 Герда всё видит 👀",
@@ -45,7 +44,6 @@ BAD_WORD_REACTIONS = [
     "Такие слова — это для слабаков. Ты же не слабак? 😬",
 ]
 
-# Позорные ранги за нарушения
 SHAME_RANKS = [
     "🤡 Додик",
     "👶 Маменькин сынок",
@@ -61,7 +59,6 @@ SHAME_RANKS = [
     "🐒 Обезьянка балованная",
 ]
 
-# Ответы когда упоминают Герду
 MENTION_REPLIES = [
     "Какого тут школотрончика мне опустить? 😈",
     "Я здесь, я всё вижу, я всё помню 👁️",
@@ -80,7 +77,6 @@ MENTION_REPLIES = [
     "Ку-ку! Герда из кустов наблюдает 🌿👀",
 ]
 
-# Авто-сообщения когда чат молчит
 AUTO_MESSAGES = [
     "Эй, тут вообще кто-нибудь есть? Герда скучает 👀",
     "Тишина... Может обсудим что-нибудь интересное? 🤔",
@@ -97,12 +93,25 @@ AUTO_MESSAGES = [
     "Герда объявляет конкурс на самое смешное сообщение! Призы воображаемые 🎁",
 ]
 
+_last_auto_sent: int = 0
+
+SHAME_HOURS = 6  # часов действует позорное прозвище
+
 
 def display_name(user) -> str:
     row = db.get_user(user.id)
-    if row and row["nickname"]:
-        return row["nickname"]
+    if row:
+        nick = db.get_active_nickname(row)
+        if nick:
+            return nick
     return user.full_name or user.username or str(user.id)
+
+
+def display_name_from_row(row) -> str:
+    nick = db.get_active_nickname(row)
+    if nick:
+        return nick
+    return row["full_name"] or row["username"] or str(row["user_id"])
 
 
 def contains_bad_word(text: str) -> bool:
@@ -141,7 +150,6 @@ async def mute_user(chat_id: int, user_id: int, seconds: int = 300):
 
 
 async def warn_user_bad(message: Message, user, mute_seconds: int = 300) -> int:
-    """Предупреждение за мат — с весёлой реакцией и позорным рангом."""
     warns = db.add_warning(user.id)
     name = display_name(user)
     reaction = random.choice(BAD_WORD_REACTIONS)
@@ -151,10 +159,10 @@ async def warn_user_bad(message: Message, user, mute_seconds: int = 300) -> int:
         await message.reply(
             f"{reaction}\n\n"
             f"⛔ <b>{name}</b>, это уже {warns}/{config.WARN_LIMIT} предупреждений!\n"
-            f"Мут на 5 минут! Новый титул: <b>{shame}</b> 🎭",
+            f"Мут на 5 минут! Новый титул на {SHAME_HOURS} часов: <b>{shame}</b> 🎭",
             parse_mode="HTML"
         )
-        db.set_nickname(user.id, shame)
+        db.set_shame_nickname(user.id, shame, hours=SHAME_HOURS)
         await mute_user(message.chat.id, user.id, mute_seconds)
         db.reset_warnings(user.id)
     else:
@@ -162,14 +170,13 @@ async def warn_user_bad(message: Message, user, mute_seconds: int = 300) -> int:
         await message.reply(
             f"{reaction}\n\n"
             f"⚠️ <b>{name}</b>, предупреждение {warns}/{config.WARN_LIMIT}.\n"
-            f"Ещё {remaining} — и получишь титул <b>{shame}</b> + мут 🤫",
+            f"Ещё {remaining} — и получишь титул <b>{shame}</b> на {SHAME_HOURS} часов + мут 🤫",
             parse_mode="HTML"
         )
     return warns
 
 
 async def warn_user(message: Message, user, reason: str, mute_seconds: int = 300) -> int:
-    """Обычное предупреждение (спам, ссылки)."""
     warns = db.add_warning(user.id)
     name = display_name(user)
 
@@ -178,10 +185,10 @@ async def warn_user(message: Message, user, reason: str, mute_seconds: int = 300
         await message.reply(
             f"⛔ <b>{name}</b>, {reason}\n"
             f"Предупреждений: {warns}/{config.WARN_LIMIT} — мут на 5 минут!\n"
-            f"Новый титул: <b>{shame}</b> 🎭",
+            f"Новый титул на {SHAME_HOURS} часов: <b>{shame}</b> 🎭",
             parse_mode="HTML"
         )
-        db.set_nickname(user.id, shame)
+        db.set_shame_nickname(user.id, shame, hours=SHAME_HOURS)
         await mute_user(message.chat.id, user.id, mute_seconds)
         db.reset_warnings(user.id)
     else:
@@ -217,7 +224,7 @@ async def on_new_member(event: ChatMemberUpdated):
     await bot.send_message(event.chat.id, random.choice(greetings), parse_mode="HTML")
 
 
-# ══ КОМАНДЫ — ПЕРВЫМИ ══
+# ══ КОМАНДЫ ══
 
 @dp.message(Command("mystats"))
 async def cmd_mystats(message: Message):
@@ -230,7 +237,18 @@ async def cmd_mystats(message: Message):
     rank = db.get_rank(row["messages"])
     next_rank, left = db.get_next_rank(row["messages"])
     name = display_name(user)
-    nick = row["nickname"] or "нет"
+    nick = db.get_active_nickname(row)
+    nick_display = nick if nick else "нет"
+
+    # Показываем когда слетит позорное прозвище
+    shame_line = ""
+    if nick and row["nickname_expires_at"]:
+        expires_in = row["nickname_expires_at"] - int(time.time())
+        if expires_in > 0:
+            hours_left = expires_in // 3600
+            mins_left = (expires_in % 3600) // 60
+            shame_line = f"\n⏳ Позорный титул слетит через: <b>{hours_left}ч {mins_left}м</b>"
+
     next_line = f"\n📈 До следующего ранга: <b>{left}</b> сообщений ({next_rank})" if next_rank else "\n🏆 Ты на максимальном ранге!"
 
     await message.reply(
@@ -238,7 +256,8 @@ async def cmd_mystats(message: Message):
         f"🏅 Ранг: <b>{rank}</b>\n"
         f"💬 Сообщений: <b>{row['messages']}</b>\n"
         f"⚠️ Предупреждений: <b>{row['warnings']}</b>\n"
-        f"🎭 Прозвище: <b>{nick}</b>"
+        f"🎭 Прозвище: <b>{nick_display}</b>"
+        f"{shame_line}"
         f"{next_line}",
         parse_mode="HTML"
     )
@@ -255,7 +274,7 @@ async def cmd_top(message: Message):
     medals = ["🥇", "🥈", "🥉"]
     for i, row in enumerate(users):
         medal = medals[i] if i < 3 else f"{i+1}."
-        name = row["nickname"] or row["full_name"] or row["username"] or str(row["user_id"])
+        name = display_name_from_row(row)
         rank = db.get_rank(row["messages"])
         lines.append(f"{medal} <b>{name}</b> — {row['messages']} сообщ. | {rank}")
 
@@ -286,7 +305,7 @@ async def cmd_setnick(message: Message):
         await message.reply(f"Пользователь {target_mention} не найден в базе 🤔")
         return
 
-    db.set_nickname(row["user_id"], nickname)
+    db.set_nickname(row["user_id"], nickname, expires_at=0)  # постоянное
     await message.reply(
         f"✅ <b>{row['full_name']}</b> теперь называется <b>{nickname}</b> 🎭",
         parse_mode="HTML"
@@ -306,7 +325,7 @@ async def cmd_mynick(message: Message):
         return
 
     db.upsert_user(message.from_user.id, message.from_user.username or "", message.from_user.full_name or "")
-    db.set_nickname(message.from_user.id, nickname)
+    db.set_nickname(message.from_user.id, nickname, expires_at=0)  # постоянное
     await message.reply(f"✅ Теперь тебя зовут <b>{nickname}</b> 🎭", parse_mode="HTML")
 
 
@@ -336,7 +355,6 @@ async def cmd_unwarn(message: Message):
     db.reset_warnings(target.id)
     name = display_name(target)
     await message.reply(f"✅ Предупреждения <b>{name}</b> сброшены", parse_mode="HTML")
-
 
 
 @dp.message(Command("unmute"))
@@ -393,10 +411,9 @@ async def cmd_help(message: Message):
         "• Без мата\n"
         "• Без спама\n"
         "• Без сторонних ссылок\n"
-        f"• {config.WARN_LIMIT} предупреждения = мут + позорный титул 🎭",
+        f"• {config.WARN_LIMIT} предупреждения = мут + позорный титул на {SHAME_HOURS}ч 🎭",
         parse_mode="HTML"
     )
-
 
 
 @dp.message(Command("roll"))
@@ -417,7 +434,7 @@ async def cmd_roll(message: Message):
     await message.reply(result, parse_mode="HTML")
 
 
-# ══ ОСНОВНОЙ ХЕНДЛЕР — ПОСЛЕДНИМ ══
+# ══ ОСНОВНОЙ ХЕНДЛЕР ══
 
 @dp.message()
 async def handle_message(message: Message):
@@ -433,12 +450,10 @@ async def handle_message(message: Message):
 
     text = message.text or message.caption or ""
 
-    # Упоминание Герды
     if text and ("герда" in text.lower() or "@gerda_manager_bot" in text.lower()):
         await message.reply(random.choice(MENTION_REPLIES))
         return
 
-    # Запрещённые ссылки
     if text and contains_forbidden_link(text):
         try:
             await message.delete()
@@ -447,17 +462,19 @@ async def handle_message(message: Message):
         await warn_user(message, user, "не размещай чужие ссылки в чате! 🔗❌")
         return
 
-    # Мат
     if text and contains_bad_word(text):
         await warn_user_bad(message, user)
         return
 
-    # Спам
     if db.check_spam(user.id, config.SPAM_MAX_MESSAGES, config.SPAM_INTERVAL_SECONDS):
-        await warn_user(message, user, "не флуди! 📵")
+        name = display_name(user)
+        await message.reply(
+            f"🤐 <b>{name}</b>, не флуди! Мут на 1 минуту 📵",
+            parse_mode="HTML"
+        )
+        await mute_user(message.chat.id, user.id, config.SPAM_MUTE_SECONDS)
         return
 
-    # Ранги
     old_row = db.get_user(user.id)
     old_msgs = old_row["messages"] if old_row else 0
     old_rank = db.get_rank(old_msgs)
@@ -475,25 +492,65 @@ async def handle_message(message: Message):
 
 
 async def auto_message_scheduler():
+    """Авто-сообщение когда чат молчит 4 часа."""
+    global _last_auto_sent
     await asyncio.sleep(10)
     while True:
-        await asyncio.sleep(30)
+        await asyncio.sleep(60)
         try:
             last = db.get_last_activity()
-            silent_for = int(time.time()) - last
+            now = int(time.time())
+            silent_for = now - last
             if silent_for >= config.AUTO_MESSAGE_INTERVAL:
-                msg = random.choice(AUTO_MESSAGES)
-                await bot.send_message(config.CHAT_ID, msg)
-                db.update_chat_activity()
-                logging.info(f"Авто-сообщение отправлено (тишина {silent_for}с)")
+                if now - _last_auto_sent >= config.AUTO_MESSAGE_INTERVAL:
+                    msg = random.choice(AUTO_MESSAGES)
+                    await bot.send_message(config.CHAT_ID, msg)
+                    _last_auto_sent = now
+                    logging.info(f"Авто-сообщение отправлено (тишина {silent_for}с)")
         except Exception as e:
             logging.error(f"Ошибка в планировщике: {e}")
+
+
+async def auto_top_scheduler():
+    """Авто-топ 3 каждые 6 часов."""
+    await asyncio.sleep(30)
+    while True:
+        await asyncio.sleep(config.AUTO_TOP_INTERVAL)
+        try:
+            users = db.get_top_users(3)
+            if not users:
+                continue
+
+            medals = ["🥇", "🥈", "🥉"]
+            lines = ["🏆 <b>Топ-3 самых активных участников чата!</b>\n"]
+            for i, row in enumerate(users):
+                name = display_name_from_row(row)
+                rank = db.get_rank(row["messages"])
+                lines.append(f"{medals[i]} <b>{name}</b> — {row['messages']} сообщ. | {rank}")
+
+            lines.append("\nПродолжайте в том же духе! 💪")
+            await bot.send_message(config.CHAT_ID, "\n".join(lines), parse_mode="HTML")
+            logging.info("Авто-топ 3 отправлен")
+        except Exception as e:
+            logging.error(f"Ошибка в авто-топ планировщике: {e}")
+
+
+async def shame_expiry_scheduler():
+    """Каждые 10 минут чистит истёкшие позорные прозвища."""
+    while True:
+        await asyncio.sleep(600)
+        try:
+            db.expire_shame_nicknames()
+        except Exception as e:
+            logging.error(f"Ошибка в планировщике прозвищ: {e}")
 
 
 async def main():
     db.init_db()
     logging.info("Герда запускается... 🚀")
     asyncio.create_task(auto_message_scheduler())
+    asyncio.create_task(auto_top_scheduler())
+    asyncio.create_task(shame_expiry_scheduler())
     await dp.start_polling(bot, allowed_updates=["message", "chat_member"])
 
 

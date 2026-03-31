@@ -15,27 +15,34 @@ def init_db():
     with get_conn() as conn:
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS users (
-                user_id     INTEGER PRIMARY KEY,
-                username    TEXT,
-                full_name   TEXT,
-                nickname    TEXT,
-                messages    INTEGER DEFAULT 0,
-                warnings    INTEGER DEFAULT 0,
-                joined_at   INTEGER DEFAULT (strftime('%s','now'))
+                user_id             INTEGER PRIMARY KEY,
+                username            TEXT,
+                full_name           TEXT,
+                nickname            TEXT,
+                nickname_expires_at INTEGER DEFAULT 0,
+                messages            INTEGER DEFAULT 0,
+                warnings            INTEGER DEFAULT 0,
+                joined_at           INTEGER DEFAULT (strftime('%s','now'))
             );
 
             CREATE TABLE IF NOT EXISTS spam_tracker (
-                user_id     INTEGER PRIMARY KEY,
-                count       INTEGER DEFAULT 0,
+                user_id      INTEGER PRIMARY KEY,
+                count        INTEGER DEFAULT 0,
                 window_start INTEGER DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS chat_activity (
-                id          INTEGER PRIMARY KEY,
-                last_message_at INTEGER DEFAULT 0
+                id               INTEGER PRIMARY KEY,
+                last_message_at  INTEGER DEFAULT 0
             );
         """)
-        # Инициализируем запись об активности чата если нет
+        # Добавляем колонку если её нет (для существующих БД)
+        try:
+            conn.execute("ALTER TABLE users ADD COLUMN nickname_expires_at INTEGER DEFAULT 0")
+            conn.commit()
+        except Exception:
+            pass  # колонка уже есть
+
         conn.execute("""
             INSERT OR IGNORE INTO chat_activity (id, last_message_at)
             VALUES (1, ?)
@@ -65,7 +72,6 @@ def upsert_user(user_id: int, username: str, full_name: str):
 
 
 def increment_messages(user_id: int) -> int:
-    """Прибавляет 1 сообщение и возвращает новый счёт."""
     with get_conn() as conn:
         conn.execute(
             "UPDATE users SET messages = messages + 1 WHERE user_id = ?",
@@ -79,7 +85,6 @@ def increment_messages(user_id: int) -> int:
 
 
 def add_warning(user_id: int) -> int:
-    """Прибавляет предупреждение, возвращает текущее количество."""
     with get_conn() as conn:
         conn.execute(
             "UPDATE users SET warnings = warnings + 1 WHERE user_id = ?",
@@ -100,12 +105,42 @@ def reset_warnings(user_id: int):
         conn.commit()
 
 
-def set_nickname(user_id: int, nickname: str):
+def set_nickname(user_id: int, nickname: str, expires_at: int = 0):
+    """Устанавливает прозвище. expires_at=0 — постоянное, иначе временное."""
     with get_conn() as conn:
         conn.execute(
-            "UPDATE users SET nickname = ? WHERE user_id = ?",
-            (nickname, user_id)
+            "UPDATE users SET nickname = ?, nickname_expires_at = ? WHERE user_id = ?",
+            (nickname, expires_at, user_id)
         )
+        conn.commit()
+
+
+def set_shame_nickname(user_id: int, nickname: str, hours: int = 6):
+    """Позорное прозвище на N часов."""
+    expires_at = int(time.time()) + hours * 3600
+    set_nickname(user_id, nickname, expires_at)
+
+
+def get_active_nickname(row) -> str | None:
+    """Возвращает прозвище если оно ещё активно, иначе None."""
+    if not row["nickname"]:
+        return None
+    expires_at = row["nickname_expires_at"] or 0
+    # expires_at == 0 означает постоянное прозвище
+    if expires_at == 0 or int(time.time()) < expires_at:
+        return row["nickname"]
+    return None
+
+
+def expire_shame_nicknames():
+    """Сбрасывает истёкшие позорные прозвища."""
+    now = int(time.time())
+    with get_conn() as conn:
+        conn.execute("""
+            UPDATE users
+            SET nickname = NULL, nickname_expires_at = 0
+            WHERE nickname_expires_at > 0 AND nickname_expires_at <= ?
+        """, (now,))
         conn.commit()
 
 
@@ -127,7 +162,6 @@ def get_rank(messages: int) -> str:
 
 
 def get_next_rank(messages: int):
-    """Возвращает (следующий_ранг, сколько_осталось) или None если макс."""
     for i, (threshold, title) in enumerate(RANKS):
         if messages < threshold:
             return title, threshold - messages
@@ -137,7 +171,6 @@ def get_next_rank(messages: int):
 # ───── Антиспам ─────
 
 def check_spam(user_id: int, max_msgs: int, interval: int) -> bool:
-    """Возвращает True если пользователь спамит."""
     now = int(time.time())
     with get_conn() as conn:
         row = conn.execute(
@@ -153,7 +186,6 @@ def check_spam(user_id: int, max_msgs: int, interval: int) -> bool:
             return False
 
         if now - row["window_start"] > interval:
-            # Новое окно
             conn.execute(
                 "UPDATE spam_tracker SET count = 1, window_start = ? WHERE user_id = ?",
                 (now, user_id)
